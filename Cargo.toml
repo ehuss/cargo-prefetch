@@ -1,0 +1,21 @@
+[package]
+name = "cargo-prefetch"
+version = "0.1.0"
+authors = ["Eric Huss"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+keywords = ["cargo"]
+categories = ["development-tools::cargo-plugins"]
+readme = "README.md"
+description = "Cargo subcommand to download popular crates."
+homepage = "https://github.com/ehuss/cargo-prefetch"
+repository = "https://github.com/ehuss/cargo-prefetch"
+
+[dependencies]
+clap = { version = "2.33", features = ["wrap_help"] }
+failure = "0.1"
+reqwest = "0.9"
+serde = "1.0"
+serde_derive = "1.0"
+tempfile = "3.0"
+toml = "0.5"
