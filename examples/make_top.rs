@@ -1,4 +1,4 @@
-use failure::Fallible;
+use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -12,17 +12,17 @@ fn main() {
     };
     if let Err(e) = doit(&path) {
         eprintln!("error: {}", e);
-        for cause in e.iter_causes() {
+        for cause in e.chain() {
             eprintln!("Caused by: {}", cause);
         }
         std::process::exit(1);
     }
 }
 
-fn doit(index: &PathBuf) -> Fallible<()> {
+fn doit(index: &PathBuf) -> Result<()> {
     let mut counts = HashMap::new();
 
-    reg_index::list_all(index, None, None, |_pkg_name, entries| {
+    reg_index::list_all(index, None, None, |entries| {
         if let Some(pkg) = entries.into_iter().max_by(|a, b| a.vers.cmp(&b.vers)) {
             for dep in pkg.deps {
                 *counts.entry(dep.name).or_insert(0) += 1;
