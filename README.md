@@ -47,5 +47,9 @@ downloaded, run with `--help` to see the options.
 6. `cargo prefetch --top-downloads=400`
 
     Download the top 400 most downloaded crates.
+ 
+8. `cargo prefetch --lockfile Cargo.lock`
+
+    Download the crates listed in `Cargo.lock` (the flattened transitive dependency graph of a project).
 
 [serde]: https://crates.io/crates/serde

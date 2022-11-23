@@ -1,11 +1,14 @@
 use anyhow::{anyhow, bail, format_err, Context, Result};
 use clap::{crate_version, App, AppSettings, Arg, SubCommand};
 use serde_derive::Deserialize;
-use std::collections::HashSet;
-use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    process::Command,
+};
 use tempfile::TempDir;
+use toml::Value;
 
 mod top;
 
@@ -30,7 +33,7 @@ async fn main() {
     }
 }
 
-type CrateSet = HashSet<(String, Option<String>)>;
+type CrateSet = HashMap<String, HashSet<String>>;
 
 async fn run() -> Result<()> {
     let app_matches = App::new("cargo-prefetch")
@@ -77,6 +80,12 @@ async fn run() -> Result<()> {
                              Specify a value for the number to download, default is 100.",
                         ),
                 )
+                .arg(
+                    Arg::with_name("lockfile")
+                        .long("lockfile")
+                        .takes_value(true)
+                        .help("Download all crates listed in the specified lockfile."),
+                )
                 .arg(Arg::with_name("crates").multiple(true).help(
                     "Specify individual crates to download. \
                      Use the syntax `crate_name@=2.7.0` to download a specific version.",
@@ -108,19 +117,23 @@ async fn run() -> Result<()> {
     let top_downloads = parse_int("top-downloads")?;
 
     // Default behavior with no command-line options.
-    if !matches.is_present("crates") && top_deps.is_none() && top_downloads.is_none() {
+    if !matches.is_present("crates")
+        && !matches.is_present("lockfile")
+        && top_deps.is_none()
+        && top_downloads.is_none()
+    {
         top_deps = Some(100);
     }
 
-    let mut crates: CrateSet = HashSet::new();
+    let mut crates: CrateSet = HashMap::new();
     if let Some(top) = top_deps {
         for name in top::TOP_CRATES.iter().take(top) {
-            crates.insert((name.to_string(), None));
+            crates.entry(name.to_string()).or_insert_with(HashSet::new);
         }
     }
     if let Some(top) = top_downloads {
         for name in top_crates_io(verbose, top).await? {
-            crates.insert((name.to_string(), None));
+            crates.entry(name.to_string()).or_insert_with(HashSet::new);
         }
     }
 
@@ -129,8 +142,16 @@ async fn run() -> Result<()> {
             let mut splits = krate.split('@');
             let name = splits.next().ok_or_else(|| format_err!("empty argument"))?;
             let version = splits.next().map(|s| s.to_string());
-            crates.insert((name.to_string(), version));
+            crates
+                .entry(name.to_string())
+                .or_insert_with(HashSet::new)
+                // add the version if present
+                .extend(version.into_iter().collect::<Vec<_>>());
         }
+    }
+
+    if let Some(lockfile) = matches.value_of("lockfile") {
+        parse_lockfile(Path::new(lockfile), &mut crates)?;
     }
 
     if matches.is_present("list") {
@@ -197,15 +218,29 @@ fn list(verbose: bool, crates: &CrateSet) -> Result<()> {
 
 /// Create a temporary Cargo project with the given dependencies.
 fn make_project(tmp_path: &Path, crates: &CrateSet) -> Result<()> {
-    let newest = "*".to_string();
+    let invalid_pkg_name_chars = regex::Regex::new("[^-_0-9a-zA-Z]").unwrap();
     let deps: Vec<String> = crates
         .iter()
-        .map(|(name, version)| {
-            format!(
-                "\"{}\" = \"{}\"\n",
-                name,
-                version.as_ref().unwrap_or(&newest)
-            )
+        .map(|(name, versions)| {
+            if versions.is_empty() {
+                // use newest
+                format!("\"{}\" = \"*\"\n", name,)
+            } else {
+                versions
+                    .iter()
+                    .map(|v| {
+                        // combine name and version for pkg alias to allow multiple versions
+                        format!(
+                            "\"{}__{}\" = {{ package = \"{}\", version = \"{}\" }}\n",
+                            name,
+                            invalid_pkg_name_chars.replace_all(v, "_"),
+                            name,
+                            v
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            }
         })
         .collect();
 
@@ -271,6 +306,8 @@ async fn top_crates_io(verbose: bool, mut count: usize) -> Result<Vec<String>> {
     const CRATES_IO_MAX: usize = 100;
     let mut result = Vec::new();
     let mut page = 1;
+    let client = reqwest::Client::new();
+
     while count > 0 {
         let n = count.min(CRATES_IO_MAX);
         let q = format!(
@@ -280,7 +317,14 @@ async fn top_crates_io(verbose: bool, mut count: usize) -> Result<Vec<String>> {
         if verbose {
             eprintln!("Sending request: {}", q);
         }
-        let response = reqwest::get(&q)
+        let response = client
+            .get(&q)
+            // crates.io requires a meaningful user agent
+            .header(
+                "User-Agent",
+                "cargo-prefetch (https://github.com/ehuss/cargo-prefetch)",
+            )
+            .send()
             .await
             .map_err(|e| anyhow!(e))
             .with_context(|| "Failed to fetch top crates from crates.io.")?;
@@ -312,4 +356,42 @@ async fn top_crates_io(verbose: bool, mut count: usize) -> Result<Vec<String>> {
         count -= n;
     }
     Ok(result)
+}
+
+fn parse_lockfile(lockfile: &Path, crates: &mut CrateSet) -> Result<()> {
+    let toml_value = fs::read_to_string(lockfile)?.parse::<Value>()?;
+    let packages = toml_value
+        .as_table()
+        .and_then(|t| t.get("package").and_then(|value| value.as_array()))
+        .and_then(|packages| {
+            packages
+                .iter()
+                .map(|value| value.as_table())
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| anyhow!("Unexpected toml structure"))?;
+
+    for pkg in packages {
+        // only look for crates.io packages
+        if !(pkg.get("source").and_then(|v| v.as_str())
+            == Some("registry+https://github.com/rust-lang/crates.io-index"))
+        {
+            continue;
+        }
+        let name = pkg
+            .get("name")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .ok_or_else(|| anyhow!("Missing package name"))?;
+        let version = pkg
+            .get("version")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .ok_or_else(|| anyhow!("Missing package version"))?;
+
+        crates
+            .entry(name.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(version);
+    }
+
+    Ok(())
 }

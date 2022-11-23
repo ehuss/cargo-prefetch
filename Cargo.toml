@@ -20,6 +20,7 @@ serde = "1.0"
 serde_derive = "1.0"
 tempfile = "3.0"
 toml = "0.5"
+regex="1.7.0"
 
 [dev-dependencies]
 reg-index = "0.5.0"
